@@ -17,6 +17,7 @@ const phyx = require('@phyloref/phyx');
 const child_process = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const TapParser = require('tap-parser');
 const chai = require('chai');
 const assert = chai.assert;
 
@@ -70,11 +71,18 @@ describe('Test PHYX files in repository', function() {
 
             // Read the PHYX data as UTF-8 and convert it into JSON-LD.
             const phyxContent = data.toString('utf-8');
-            var jsonld;
+            let json;
+            let jsonld;
             try {
-              const json = JSON.parse(phyxContent);
+              json = JSON.parse(phyxContent);
               const wrappedPhyx = new phyx.PHYXWrapper(json);
-              jsonld = JSON.stringify(wrappedPhyx.asJSONLD());
+              jsonld = JSON.stringify(wrappedPhyx.asJSONLD(), null, 4);
+
+              // Let's write the JSON-LD into a file for debugging.
+              fs.writeFileSync(
+                filename.replace(/.json$/, '_as_owl.json'),
+                jsonld
+              );
             } catch(ex) {
               it('Exception thrown while converting PHYX to JSON-LD', function() {
                 throw ex;
@@ -87,8 +95,60 @@ describe('Test PHYX files in repository', function() {
               assert.isNotEmpty(jsonld);
             });
 
+            // Write out information about the tested phyloreferences.
+            it('contains one or more phyloreferences', function() {
+              assert.property(json, 'phylorefs');
+              assert.isAbove(json.phylorefs.length, 0);
+            });
+
+            // Create a dictionary of phyloreferences by label.
+            const wrappedPhylorefsByLabel = {};
+            json.phylorefs.forEach(phyloref => {
+              const wrapped = new phyx.PhylorefWrapper(phyloref);
+              wrappedPhylorefsByLabel[wrapped.label] = wrapped;
+            });
+
+            // Set up a TapParser.
+            const tapParser = new TapParser(result => {
+              it('should test all phyloreferences', function () {
+                assert.equal(result.count, json.phylorefs.length, 'number of test results should equal the number of phylorefs in file');
+              });
+            });
+            tapParser.on('assert', result => {
+              const matches = result.name.match(/^Phyloreference '(.*)'$/);
+              if(matches === null) {
+                throw new RuntimeException(`Invalid test name: '${result.name}'`);
+              }
+
+              const phyloref = wrappedPhylorefsByLabel[matches[1]];
+              if(!phyloref) {
+                throw new RuntimeException(`Phyloreference '${matches[1]}' was tested but is not present in the input PHYX file`);
+              }
+
+              const countInternal = phyloref.phyloref.internalSpecifiers.length;
+              const countExternal = phyloref.phyloref.externalSpecifiers.length;
+              describe(`Phyloreference ${phyloref.label} (${countInternal} internal specifiers, ${countExternal} external specifiers)`, function () {
+                phyloref.specifiers.forEach(specifier => {
+                  it('Includes ' +  phyloref.getSpecifierType(specifier).toLowerCase() +
+                    ' specifier ' + phyx.PhylorefWrapper.getSpecifierLabel(specifier), function () {
+                      assert(true);
+                    });
+                });
+
+                if (result.hasOwnProperty('todo')) {
+                  it.skip('Skipping as TODO: ' + result.todo);
+                } else if (result.hasOwnProperty('skip')) {
+                  it.skip('Skipping: ' + result.skip);
+                } else {
+                  it('should pass testing', function () {
+                    assert(assert.ok);
+                  });
+                }
+              });
+            });
+
             // Test the produced JSON-LD using JPhyloRef.
-            var args = [
+            let args = [
               '-jar', 'jphyloref/jphyloref.jar',
               'test', '-', '--jsonld'
             ];
@@ -107,6 +167,9 @@ describe('Test PHYX files in repository', function() {
             // Execute the command line, giving it the JSON-LD on STDIN.
             const child = child_process.spawnSync('java', args, { input: jsonld });
 
+            tapParser.write(child.stdout);
+            tapParser.end();
+
             // Test whether we can read the test result line from JPhyloRef.
             // Eventually, we will parse the TAP results directly.
             const matches = /Testing complete:(\d+) successes, (\d+) failures, (\d+) failures marked TODO, (\d+) skipped./.exec(child.stderr);
@@ -114,43 +177,45 @@ describe('Test PHYX files in repository', function() {
               assert.isNotNull(matches, 'Test result line not found in STDOUT');
             });
 
-            // Test whether we have any failures.
-            it('did not report any failures', function() {
-              const failures = matches[2];
-              assert.equal(failures, 0, failures + ' failures occurred during testing');
-            });
+            if(matches) {
+                // Test whether we have any failures.
+                it('did not report any failures', function() {
+                  const failures = matches[2];
+                  assert.equal(failures, 0, `${failures} failures occurred during testing:\n===STDOUT===\n${child.stdout}\n===STDERR===\n${child.stderr}\n===`);
+                });
 
-            // Look for TODOs or skipped tests.
-            const successes = matches[1];
-            const todos = matches[3];
-            const skipped = matches[4];
+              // Look for TODOs or skipped tests.
+              const successes = matches[1];
+              const todos = matches[3];
+              const skipped = matches[4];
 
-            if(todos > 0) {
-              // TODOs are phyloreferences that we didn't expect to resolve.
-              it.skip(todos + ' phyloreferences were marked as TODO during testing.');
-              return;
+              if(todos > 0) {
+                // TODOs are phyloreferences that we didn't expect to resolve.
+                it.skip(todos + ' phyloreferences were marked as TODO during testing.');
+                return;
+              }
+
+              if(skipped > 0) {
+                // Skipped phyloreferences are here for historical reasons: JPhyloRef
+                // won't actually recognize any phyloreferences as skipped. This has
+                // been reported as https://github.com/phyloref/jphyloref/issues/40
+                it.skip(skipped + ' phyloreferences were skipped during testing.');
+                return;
+              }
+
+              // We could have zero failures but also zero successes. A Phyx file
+              // without any failures, TODOs or any successes in the Clade Ontology
+              // should be reported as a failure.
+              it('had at least one success', function() {
+                assert.isAbove(successes, 0, `No successes occurred during testing:\n===STDOUT===\n${child.stdout}\n===STDERR===\n${child.stderr}\n===`);
+              });
+
+              // On the off chance that all of the above made sense but the exit code didn't,
+              // we'll check that here.
+              it('passed testing in JPhyloRef', function() {
+                assert.equal(child.status, 0, 'Exit code from JPhyloRef was not zero');
+              });
             }
-
-            if(skipped > 0) {
-              // Skipped phyloreferences are here for historical reasons: JPhyloRef
-              // won't actually recognize any phyloreferences as skipped. This has
-              // been reported as https://github.com/phyloref/jphyloref/issues/40
-              it.skip(skipped + ' phyloreferences were skipped during testing.');
-              return;
-            }
-
-            // We could have zero failures but also zero successes. A Phyx file
-            // without any failures, TODOs or any successes in the Clade Ontology
-            // should be reported as a failure.
-            it('had at least one success', function() {
-              assert.isAbove(successes, 0, 'No successes occurred during testing');
-            });
-
-            // On the off chance that all of the above made sense but the exit code didn't,
-            // we'll check that here.
-            it('passed testing in JPhyloRef', function() {
-              assert.equal(child.status, 0, 'Exit code from JPhyloRef was not zero');
-            });
         });
     });
 });
